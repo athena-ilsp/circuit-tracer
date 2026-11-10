@@ -52,12 +52,24 @@ class JumpReLU(torch.nn.Module):
 
 
 class TopK(nn.Module):
-    def __init__(self, k: int):
+    """Keep the ``k`` largest pre-activations per row and zero the rest.
+
+    ``relu=True`` also zeroes the negative survivors, for transcoders trained with ReLU applied to
+    the top ``k`` (``relu(topk(x))``, which equals ``topk(relu(x))``). It differs from plain top-k
+    only on rows with fewer than ``k`` positive pre-activations, where plain top-k keeps negatives.
+    """
+
+    def __init__(self, k: int, relu: bool = False):
         super().__init__()
         self.k = k
+        self.relu = relu
 
     def forward(self, x: torch.Tensor):
         _, indices = torch.topk(x, k=self.k, dim=-1)
         gate = torch.zeros_like(x)
         gate.scatter_(dim=-1, index=indices, value=1)
-        return x * gate.to(x.dtype)
+        out = x * gate.to(x.dtype)
+        return torch.relu(out) if self.relu else out
+
+    def extra_repr(self) -> str:
+        return f"k={self.k}, relu={self.relu}"

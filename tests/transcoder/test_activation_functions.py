@@ -36,3 +36,19 @@ def test_TopK():
     # Should keep the 2 largest values in each row and zero the rest
     expected = torch.tensor([[0.0, 5.0, 3.0, 0.0], [4.0, 0.0, 6.0, 0.0]])
     assert torch.allclose(result, expected)
+
+
+def test_TopK_relu_zeroes_negative_survivors():
+    x = torch.tensor([[3.0, -1.0, -2.0, -5.0]])
+    # Fewer positives than k: plain top-k keeps the negatives, relu=True zeroes them.
+    assert torch.equal(TopK(k=3)(x), torch.tensor([[3.0, -1.0, -2.0, 0.0]]))
+    assert torch.equal(TopK(k=3, relu=True)(x), torch.tensor([[3.0, 0.0, 0.0, 0.0]]))
+
+
+def test_TopK_relu_matches_relu_then_topk():
+    x = torch.randn(64, 32, generator=torch.Generator().manual_seed(0))
+    k = 8
+    relu_first = torch.relu(x)
+    values, indices = relu_first.topk(k, dim=-1)
+    expected = torch.zeros_like(x).scatter(-1, indices, values)
+    assert torch.allclose(TopK(k, relu=True)(x), expected)

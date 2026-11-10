@@ -224,6 +224,8 @@ class SingleLayerTranscoder(nn.Module):
 
         if isinstance(self.activation_function, TopK):
             state_dict["k"] = torch.tensor(self.activation_function.k)
+            if self.activation_function.relu:
+                state_dict["topk_relu"] = torch.tensor(True)
 
         if self.W_skip is not None:
             state_dict["W_skip"] = self.W_skip.cpu()
@@ -572,7 +574,7 @@ def load_transcoder_set(
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
     special_load_fn: Literal["gemma-scope", "gemma-scope-2", None] = None,
-    # Activation function config; k is only used when activation="topk"
+    # Activation function config; k is only used when activation is "topk" or "topk_relu"
     activation: str | None = None,
     k: int | None = None,
     lazy_encoder: bool = True,
@@ -607,6 +609,9 @@ def load_transcoder_set(
             k = 128
         assert k is not None, "You must pass k if activation is topk"
         activation_fn = TopK(k)
+    elif activation == "topk_relu":
+        assert k is not None, "You must pass k if activation is topk_relu"
+        activation_fn = TopK(k, relu=True)
     elif activation == "relu":
         activation_fn = F.relu
     else:
