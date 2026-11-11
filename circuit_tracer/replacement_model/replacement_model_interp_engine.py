@@ -33,7 +33,7 @@ than asserted, because "generic" is a claim about architectures nobody has run y
 
 import sys
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, Literal, Protocol, cast
@@ -251,6 +251,10 @@ def _substitute_input(args: tuple, kwargs: dict, key: object, new: torch.Tensor)
     if key == 0:
         return ((new,) + tuple(args[1:]), kwargs)
     return (args, {**kwargs, str(key): new})
+
+
+class _TrunkInputsCaptured(Exception):
+    """Stops the multimodal base at its text trunk once the trunk's inputs are recorded."""
 
 
 class _Removable(Protocol):
@@ -549,6 +553,11 @@ class InterpEngineReplacementModel(nn.Module):
         self._feature_output_tensors: list[torch.Tensor | None] = [None] * self.n_layers
         self._feature_output_raw: list[torch.Tensor | None] = [None] * self.n_layers
         self._embed_tensor: torch.Tensor | None = None
+        # Non-token forward inputs (an image's pixel_values and friends) while `multimodal_inputs`
+        # is open; None for a text-only prompt. See that method.
+        self._forward_kwargs: dict[str, torch.Tensor] | None = None
+        # (prompt ids, the kwargs the multimodal base passed the trunk), captured once per prompt.
+        self._trunk_inputs: tuple[torch.Tensor, dict] | None = None
 
         # Where interventions extend the forward pass, walked by the permanent hooks above at the
         # points the transcoders read and write. See `_listener_hook` for why they are lists the
@@ -987,11 +996,94 @@ class InterpEngineReplacementModel(nn.Module):
             if original is not None:
                 config.final_logit_softcapping = original
 
+    # --- multimodal prompts ---------------------------------------------------
+
+    @contextmanager
+    def multimodal_inputs(self, forward_kwargs: Mapping[str, torch.Tensor]) -> Iterator[None]:
+        """Attribute a prompt that carries non-token inputs, such as an image.
+
+        ``forward_kwargs`` are what the model's processor returned besides ``input_ids`` and
+        ``attention_mask`` (``pixel_values``, and per family ``token_type_ids`` or
+        ``image_grid_thw``); the prompt passed to ``attribute`` is the processor's ``input_ids``,
+        image placeholders included. While the block is open:
+
+        * The model's multimodal base (``hf_model.model``) runs once per prompt, up to the text
+          trunk, and everything it hands the trunk is kept: the merged token + image embeddings,
+          the family's attention mask over image tokens (Gemma 3 attends bidirectionally within an
+          image) and its rotary positions (Qwen-VL's are 3-D). Every forward pass then replays
+          those inputs into the trunk, so the vision tower is not rerun per attribution batch, and
+          it sits upstream of every node in the graph anyway.
+        * The input node at each position is the tensor the trunk receives: the token embedding,
+          or at an image position the projected image feature. A text position's node is the same
+          embedding a text prompt uses; an image position's node is its patch feature, where the
+          placeholder token's embedding would contribute nothing (it is overwritten).
+
+        Interp-engine backend only, and only for a model whose ``hf_model.model`` holds the text
+        trunk as ``language_model`` and whose head is the bare ``lm_head`` (true of Gemma 3 and
+        Qwen2.5-VL, whose multimodal heads do not softcap).
+        """
+        base = getattr(self.hf_model, "model", None)
+        if base is None or getattr(base, "language_model", None) is not self.arch.trunk:
+            raise NotImplementedError(
+                f"{type(self.hf_model).__name__} has no multimodal base model holding the text trunk "
+                "as `language_model`, so non-token inputs cannot be merged."
+            )
+        self._forward_kwargs = dict(forward_kwargs)
+        self._trunk_inputs = None
+        try:
+            yield
+        finally:
+            self._forward_kwargs = None
+            self._trunk_inputs = None
+
+    def _captured_trunk_inputs(self, input_ids: torch.Tensor) -> dict:
+        """What the multimodal base passes the trunk for this prompt; computed once per prompt."""
+        assert self._forward_kwargs is not None
+        prompt = input_ids[0]
+        if self._trunk_inputs is not None and torch.equal(self._trunk_inputs[0], prompt):
+            return self._trunk_inputs[1]
+
+        captured: dict = {}
+
+        def grab(_module, _args, kwargs):
+            captured.update(kwargs)
+            raise _TrunkInputsCaptured  # the trunk itself runs later, on the replay
+
+        handle = self.arch.trunk.register_forward_pre_hook(grab, with_kwargs=True)
+        try:
+            with torch.no_grad():
+                self.hf_model.model(input_ids=prompt[None], use_cache=False, **self._forward_kwargs)
+        except _TrunkInputsCaptured:
+            pass
+        finally:
+            handle.remove()
+        if captured.get("inputs_embeds") is None:
+            raise RuntimeError(
+                f"{type(self.hf_model).__name__} did not pass `inputs_embeds` to its text trunk."
+            )
+        self._trunk_inputs = (prompt.clone(), captured)
+        return captured
+
+    def _replay_trunk(self, input_ids: torch.Tensor):
+        """Run the trunk on the captured multimodal inputs, for ``len(input_ids)`` copies."""
+        inputs = dict(self._captured_trunk_inputs(input_ids))
+        embeds = inputs.pop("inputs_embeds")
+        # The gradient source, one row per batch copy as on the text path. Every parameter is
+        # frozen, so a detached copy cuts nothing attribution reads. The mask and positions keep
+        # their batch of one and broadcast.
+        leaf = embeds.detach().expand(input_ids.shape[0], -1, -1).clone().requires_grad_(True)
+        self._embed_tensor = leaf
+        return self.arch.trunk(inputs_embeds=leaf, **inputs)
+
     # --- forward paths --------------------------------------------------------
 
     def forward(self, input_ids: torch.Tensor, **kwargs):
         if input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
+        if self._forward_kwargs is not None:
+            if kwargs:
+                raise NotImplementedError(f"forward kwargs {sorted(kwargs)} with multimodal inputs")
+            return self.arch.lm_head(self._replay_trunk(input_ids).last_hidden_state)
         return self.hf_model(input_ids, use_cache=False, **kwargs).logits
 
     def forward_trunk(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1004,6 +1096,8 @@ class InterpEngineReplacementModel(nn.Module):
         """
         if input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
+        if self._forward_kwargs is not None:
+            return self._replay_trunk(input_ids).last_hidden_state
         return self.arch.trunk(input_ids, use_cache=False).last_hidden_state
 
     def get_activations(
@@ -1057,7 +1151,12 @@ class InterpEngineReplacementModel(nn.Module):
         # pre-multiply tensor, so the factor cancels and token attributions still agree with TL to
         # float precision; only this public vector differs, and it differs the same way NNSight's
         # already does.
-        token_vectors = self.embed_weight[tokens].detach()
+        token_vectors = (
+            # With an image the input nodes are what the trunk received (see `multimodal_inputs`).
+            self.embed_tensor[0].detach().clone()
+            if self._forward_kwargs is not None
+            else self.embed_weight[tokens].detach()
+        )
 
         return AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],

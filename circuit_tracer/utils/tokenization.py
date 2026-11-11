@@ -60,13 +60,18 @@ def ensure_tokenized(
 
     gemma_3_it = "gemma-3" in model_name and model_name.endswith("-it")
     if gemma_3_it:
-        ignore_prefix = torch.tensor([2, 105, 2364, 107], dtype=tokens.dtype, device=tokens.device)
+        # <bos><start_of_turn>user then a newline token. The template puts "\n" (107) there for
+        # text; with an image first it writes "user\n\n\n<start_of_image>" and "\n\n\n" is one
+        # token (109). Either way the prefix is four tokens, which zero_positions drops.
+        ignore_prefix = torch.tensor([2, 105, 2364], dtype=tokens.dtype, device=tokens.device)
         tokenization_error = (
             "Input tokens should start with <bos><start_of_turn>user\n, but got {tokens}"
         )
-        assert tokens.size(0) >= 4 and torch.all(tokens[:4] == ignore_prefix), (
-            tokenization_error.format(tokens=tokenizer.decode(tokens.cpu().tolist()))
-        )
+        assert (
+            tokens.size(0) >= 4
+            and torch.all(tokens[:3] == ignore_prefix)
+            and _is_newline_run(tokenizer.decode([int(tokens[3])]))
+        ), tokenization_error.format(tokens=tokenizer.decode(tokens.cpu().tolist()))
         return tokens
 
     # Check if a special token is already present at the beginning
@@ -91,6 +96,10 @@ def ensure_tokenized(
         tokens = torch.cat([torch.tensor([dummy_bos_token_id], device=tokens.device), tokens])
 
     return tokens.to(device)
+
+
+def _is_newline_run(text: str) -> bool:
+    return bool(text) and set(text) == {"\n"}
 
 
 def zero_positions(model_name: str) -> slice:
